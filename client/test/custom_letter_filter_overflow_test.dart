@@ -1,0 +1,1 @@
+Package size exceeded the configured limit of 50 MB. Try https://github.com/nascab/NasCabOS/tree/main/flutter_client/test/custom_letter_filter_overflow_test.dart instead.

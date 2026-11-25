@@ -1,0 +1,1975 @@
+import 'dart:async';
+import 'package:NasCabOS/modules/fileBackup/localBackup/local_backup_controller.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../../service/server_storage_service.dart';
+import '../../beans/server_info_bean.dart';
+import 'udp_broadcast_listener.dart';
+import '../../../../core/theme/theme_manager.dart';
+import 'package:NasCabOS/core/config/app_config.dart';
+
+import 'package:NasCabOS/modules/auth/service/auth_api_service.dart';
+import '../../../../core/api/api_controller.dart';
+import '../../../../core/api/proxy_bypass_config.dart';
+import '../../../../utils/cache_manager.dart';
+import '../../../../utils/dialog_util.dart';
+import '../../../../utils/device_utils.dart';
+import '../../../../utils/toast_util.dart';
+import 'package:NasCabOS/utils/legal_document_opener.dart';
+import 'package:NasCabOS/core/routes/app_routes.dart';
+import '../../../home/views/components/session_wallpaper_background.dart';
+import '../login/login_twofa_dialog.dart';
+import '../../service/response/login_response.dart';
+import '../../service/response/server_status_response.dart';
+import 'pair_code_scanner.dart';
+import '../../../../core/utils/same_machine_checker_stub.dart'
+    if (dart.library.html) '../../../../core/utils/same_machine_checker_web.dart';
+
+/// 服务器状态ViewModel
+class ServerListController extends GetxController {
+  static ServerListController get instance => Get.find<ServerListController>();
+  final UdpBroadcastListener _udpListener = UdpBroadcastListener();
+
+  static const String _prefPrivacyConsentAccepted =
+      'android_privacy_consent_accepted';
+
+  // 响应式状态变量
+  final localServerRx = Rxn<ServerInfoBean>();
+  final savedServersRx = <ServerInfoBean>[].obs;
+  final discoveredServersRx = <ServerInfoBean>[].obs;
+  final welcomeTitle = ''.obs;
+
+  final showAddServerView = false.obs; //是否显示添加服务器页面
+  final showCreateAdminView = false.obs; //是否显示创建管理员页面
+  final selectedServerRx = Rxn<ServerInfoBean>(); //当前选中的服务器
+  final ignoreLocalProxy = true.obs; //是否忽略本地代理（默认开启，所有网络请求直连）
+
+  bool _serverTapLocked = false;
+  BuildContext? _tapLoadingDialogContext;
+  int _tapLoadingToken = 0;
+  bool _tapLoadingActive = false;
+  Route<void>? _tapLoadingRoute;
+  bool _exitDialogShowing = false;
+  bool _initFlowStarted = false;
+  bool _privacyDialogShowing = false;
+
+  bool _loginCancelled = false; //本次点击登录是否已用户取消
+  Completer<void>? _tapCancelCompleter; //取消信号，与各等待点竞速
+  ServerInfoBean? _tappingServerItem; //当前点击登录的服务器
+  bool _tapLoadingProgrammaticDismiss = false; //loading是否由代码主动关闭（区分遮罩/返回键）
+
+  /// 进程内“冷启动自动登录”是否已处理。
+  ///
+  /// 仅应用进程冷启动后首次进入服务器列表时为 false；自动登录尝试后立即置为
+  /// true。应用内登出走 Get.offAllNamed(/server_list) 会重建本控制器实例，
+  /// 但该进程级 static 已为 true，不会再次触发自动登录，避免“登出后立刻被
+  /// 自动登录拉回、永远无法选择其他服务器”
+  static bool _launchAutoLoginHandled = false;
+
+  @override
+  void onInit() {
+    super.onInit();
+    // 同步“忽略本地代理”状态（ApiController.onInit 已从本地缓存加载）
+    ignoreLocalProxy.value = ProxyBypassConfig.enabled;
+    if (_initFlowStarted) return;
+    _initFlowStarted = true;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      _initFlow();
+    });
+  }
+
+  /// 切换“忽略本地代理”：写入本地缓存，并对所有网络请求即时生效
+  void setIgnoreLocalProxy(bool value) {
+    ignoreLocalProxy.value = value;
+    ProxyBypassConfig.enabled = value;
+    unawaited(CacheManager().setBool(ProxyBypassConfig.cacheKey, value));
+  }
+
+  // getter方法
+  ServerInfoBean? get localServer => localServerRx.value;
+  List<ServerInfoBean> get savedServers => savedServersRx;
+  List<ServerInfoBean> get discoveredServers => discoveredServersRx;
+
+  Future<void> _initFlow() async {
+    final consented = await _ensureAndroidPrivacyConsent();
+    if (!consented) {
+      _exitApp();
+      return;
+    }
+    await _initAfterPrivacyConsent();
+  }
+
+  Future<void> _initAfterPrivacyConsent() async {
+    await _loadSavedServers();
+
+    await startUdpListening();
+
+    final themeMode = ThemeManager().getThemeMode();
+    Get.changeThemeMode(themeMode);
+
+    // 冷启动自动登录：仅进程首次进入服务器列表时触发（应用内登出不触发）
+    if (!_launchAutoLoginHandled) {
+      _launchAutoLoginHandled = true;
+      unawaited(_tryAutoLoginOnLaunch());
+    }
+  }
+
+  /// 冷启动时若存在开启「启动时自动登录」的服务器，自动执行登录。
+  ///
+  /// 复用 handleServerTap：会显示带取消按钮的登录对话框，用户仍可取消并
+  /// 选择其他服务器；以下情况静默跳过：
+  /// - Web 端（启动入口为登录页而非服务器列表）
+  /// - 无开启该选项的服务器
+  /// - 该服务器设置了每次输入密码 / 无已保存密码（无法免输入登录）
+  Future<void> _tryAutoLoginOnLaunch() async {
+    if (kIsWeb) return;
+    ServerInfoBean? target;
+    for (final s in savedServersRx) {
+      if (s.autoLoginOnStartup) {
+        target = s;
+        break;
+      }
+    }
+    if (target == null) return;
+    if (target.needInputPwdEveryTime || (target.password ?? '').trim().isEmpty) {
+      print('[AutoLogin] 目标服务器需要输入密码或无已保存密码，跳过自动登录');
+      return;
+    }
+    // 等待 overlay 就绪（本函数不持有 BuildContext，避免跨 async gap 使用）
+    final ctxReady = await _getOverlayContextWithRetry() != null;
+    if (isClosed || !ctxReady) return;
+    // 在无前置 async gap 的函数内同步获取 context 并发起登录
+    await _startAutoLogin(target);
+  }
+
+  /// 由 [_tryAutoLoginOnLaunch] 在 overlay 就绪后调用：同步取得 context，
+  /// 复用 handleServerTap 完成自动登录
+  Future<void> _startAutoLogin(ServerInfoBean target) async {
+    final ctx = Get.overlayContext;
+    if (ctx == null) return;
+    await handleServerTap(ctx, target);
+  }
+
+  void _openLegalFromPrivacyDialog(String url, String title) {
+    final ctx = Get.overlayContext;
+    if (ctx == null) return;
+    LegalDocumentOpener.open(ctx, url: url, title: title);
+  }
+
+  Future<BuildContext?> _getOverlayContextWithRetry() async {
+    for (var i = 0; i < 60; i++) {
+      final ctx = Get.overlayContext;
+      if (ctx != null) return ctx;
+      await Future.delayed(const Duration(milliseconds: 16));
+    }
+    return null;
+  }
+
+  Future<bool> _ensureAndroidPrivacyConsent() async {
+    if (!DeviceUtils.isAndroid) return true;
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_prefPrivacyConsentAccepted) == true) return true;
+    if (_privacyDialogShowing) return false;
+    _privacyDialogShowing = true;
+    try {
+      if (await _getOverlayContextWithRetry() == null) return false;
+
+      final privacyUrl = LegalUrls.privacyUrl();
+      final agreementUrl = LegalUrls.agreementUrl();
+
+      final result = await Get.dialog<bool>(
+        DialogUtil.createAlertDialog(
+          title: Text('privacy_consent_title'.tr),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('privacy_consent_message_1'.tr),
+              const SizedBox(height: 8),
+              Text('privacy_consent_message_2'.tr),
+              const SizedBox(height: 8),
+              Text('privacy_consent_message_3'.tr),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  TextButton(
+                    onPressed: () => _openLegalFromPrivacyDialog(
+                      agreementUrl,
+                      'auth_user_agreement'.tr,
+                    ),
+                    child: Text('auth_user_agreement'.tr),
+                  ),
+                  TextButton(
+                    onPressed: () => _openLegalFromPrivacyDialog(
+                      privacyUrl,
+                      'auth_privacy_policy'.tr,
+                    ),
+                    child: Text('auth_privacy_policy'.tr),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Get.back(result: false),
+              child: Text('privacy_consent_disagree'.tr),
+            ),
+            TextButton(
+              onPressed: () => Get.back(result: true),
+              child: Text('privacy_consent_agree'.tr),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      );
+
+      if (result == true) {
+        await prefs.setBool(_prefPrivacyConsentAccepted, true);
+        return true;
+      }
+      return false;
+    } finally {
+      _privacyDialogShowing = false;
+    }
+  }
+
+  Future<void> _loadLoginConfig() async {
+    try {
+      final resp = await AuthApiService.instance.getLoginConfig();
+      if (!resp.success) return;
+      final data = resp.data ?? const {};
+      final raw = data['welcomeText'];
+      final text = raw is String ? raw.trim() : '';
+      if (text.isNotEmpty) {
+        welcomeTitle.value = text;
+        update();
+      }
+    } catch (_) {}
+  }
+
+  ///显示添加服务器组件
+  void goToAddServerView(ServerInfoBean? server) {
+    selectedServerRx.value = server;
+    showCreateAdminView.value = false;
+    showAddServerView.value = true;
+  }
+
+  ///显示创建管理员组件
+  void goToCreateAdminView(ServerInfoBean? server) {
+    selectedServerRx.value = server;
+    showAddServerView.value = false;
+    showCreateAdminView.value = true;
+  }
+
+  //添加“本机”标识
+  void addLocalSignToServerList(RxList<ServerInfoBean> serverList) {
+    //添加本地服务器标识
+    for (var server in serverList) {
+      if (server.serverId == localServerRx.value?.serverId) {
+        server.isLocalServer = true;
+      } else {
+        server.isLocalServer = false;
+      }
+    }
+    // 稳定分区：本机排在前面，其余保持既有（持久化）顺序。
+    // 不能用 List.sort（Dart sort 不保证稳定），否则手动置顶等持久化顺序
+    // 在元素较多时可能被重排
+    final locals = <ServerInfoBean>[];
+    final others = <ServerInfoBean>[];
+    for (final server in serverList) {
+      (server.isLocalServer ? locals : others).add(server);
+    }
+    serverList
+      ..clear()
+      ..addAll(locals)
+      ..addAll(others);
+  }
+
+  // 检测本机是否启用了nascab服务
+
+  /// 探测 127.0.0.1:6789 的本机服务 serverId，失败返回 null。
+  /// 临时切换 baseUrl 仅改内存态（不触发 connectChannelRevision），
+  /// 完成后自动恢复原值并通知一次 revision。
+  Future<String?> _probeLocalhostServerId() async {
+    try {
+      final restoreBaseUrl = ApiController.instance
+          .overrideBaseUrlTemporarily(AppConfig.localhostBaseUrl);
+      final serverStatus = await AuthApiService.instance
+          .checkServerStatus(
+            false,
+            timeout: const Duration(seconds: 2),
+            maxRetries: 0,
+          )
+          .whenComplete(restoreBaseUrl);
+      if (serverStatus.isNasCabServer) {
+        final id = (serverStatus.serverData?['serverId'] ?? '').toString();
+        print('[SameMachine] 127.0.0.1 探测成功, serverId=$id');
+        return id;
+      }
+      print('[SameMachine] 127.0.0.1 探测失败: isNasCabServer=false');
+    } catch (e) {
+      print('[SameMachine] 127.0.0.1 探测异常: $e');
+    }
+    return null;
+  }
+
+  /// 检测客户端与已登录的服务器是否在同一台机器上运行。
+  ///
+  /// 策略：
+  /// 1. 优先探测 127.0.0.1:6789，通过 serverId 比对（Native / Web localhost 访问）。
+  /// 2. localhost 不可达时（如 Web 端 LAN IP 访问导致 CORS），对比浏览器 hostname。
+  /// 3. 均无法判定则设为 false。
+  Future<void> _checkAndSetSameMachine(
+    String serverId,
+    String hostname,
+    String? lanIpv4,
+  ) async {
+    print('[SameMachine] === 开始同机检测 ===');
+    print(
+      '[SameMachine] 入参 serverId=$serverId, hostname=$hostname, lanIpv4=$lanIpv4',
+    );
+
+    // 1. 尝试 127.0.0.1 探测
+    final localId = await _probeLocalhostServerId();
+    if (localId != null && localId.isNotEmpty) {
+      final same = localId == serverId;
+      print(
+        '[SameMachine] serverId 比对: localId=$localId, loggedInId=$serverId, same=$same',
+      );
+      ApiController.instance.setSameMachine(same);
+      return;
+    }
+
+    // 2. localhost 不可达，Web 端对比浏览器 hostname
+    if (kIsWeb) {
+      final browserHostname = getLocalBrowserHostname();
+      print('[SameMachine] Web fallback: browserHostname=$browserHostname');
+      if (browserHostname.isNotEmpty) {
+        final same =
+            browserHostname == hostname ||
+            browserHostname == (lanIpv4 ?? '') ||
+            browserHostname == 'localhost' ||
+            browserHostname == '127.0.0.1';
+        print(
+          '[SameMachine] Web hostname 比对: browser=$browserHostname, serverHostname=$hostname, lanIpv4=${lanIpv4 ?? 'null'}, same=$same',
+        );
+        ApiController.instance.setSameMachine(same);
+        return;
+      }
+    }
+
+    // 3. 无法判定
+    print('[SameMachine] 无法判定，设为 false');
+    ApiController.instance.setSameMachine(false);
+  }
+
+  Future<void> checkLocalNasCabServerStatus() async {
+    try {
+      ApiController.instance.setBaseUrl(AppConfig.localhostBaseUrl);
+      final serverStatus = await AuthApiService.instance.checkServerStatus(
+        false,
+      );
+      if (serverStatus.isNasCabServer) {
+        localServerRx.value = ServerInfoBean(
+          serverId: serverStatus.serverData?['serverId'] ?? '',
+          serverUrl: AppConfig.localhostBaseUrl,
+          serverName: "LocalHost",
+          serverHost: '127.0.0.1',
+          serverPortHttp: serverStatus.serverData?['httpPort'] ?? '9000',
+          serverPortHttps: serverStatus.serverData?['httpsPort'] ?? '9443',
+          serverHostName: serverStatus.serverData?['hostname'] ?? 'localhost',
+          serverPlatform: serverStatus.serverData?['platform'] ?? 'unknown',
+          isAutoScanned: true,
+        );
+        addLocalSignToServerList(savedServersRx);
+        addLocalSignToServerList(discoveredServersRx);
+      }
+    } catch (e) {
+      localServerRx.value = null;
+    } finally {}
+  }
+
+  /// 处理发现的服务器
+  void _handleDiscoveredServer(Map<String, dynamic> serverInfo) {
+    try {
+      // 创建服务器对象
+      final serverItem = ServerInfoBean(
+        serverId: serverInfo['serverId'] ?? '',
+        serverUrl: 'http://${serverInfo['host']}:${serverInfo['port']}',
+        userInputUrl: '',
+        serverName: "NasCabServer",
+        serverHost: serverInfo['host'],
+        serverPortHttp: serverInfo['port'].toString(),
+        serverPortHttps: serverInfo.containsKey('httpsPort')
+            ? serverInfo['httpsPort'].toString()
+            : '',
+        serverHostName: serverInfo['hostname'],
+        serverPlatform: serverInfo['platform'],
+        isAutoScanned: true,
+      );
+      bool exists = discoveredServersRx.any(
+        (server) => ServerStorageService.isSameIdentity(server, serverItem),
+      );
+      bool savedExists = savedServersRx.any(
+        (server) => ServerStorageService.isSameIdentity(server, serverItem),
+      );
+      if (!exists && !savedExists) {
+        discoveredServersRx.add(serverItem);
+        addLocalSignToServerList(discoveredServersRx);
+        print('✅ 添加新服务器到列表: ${serverItem.serverHostName}');
+      } else {
+        // print('ℹ️ 服务器已存在: ${serverItem.serverHostName}');
+      }
+    } catch (e) {
+      print('❌ 处理发现的服务器失败: $e');
+    }
+  }
+
+  /// 处理服务器点击事件
+  ///
+  /// 通道优先级：局域网直连 > P2P（自动探测直连/中继，先连上者优先）。
+  /// - WiFi 环境优先走局域网 IP/LAN IP
+  /// - 蜂窝网络跳过私有 IP 直连，直接进入 P2P 流程
+  /// - P2P 使用 auto 模式同时探测直连/中继，连接成功后若为中继则在后台尝试升级直连
+  Future<void> handleServerTap(
+    BuildContext context,
+    ServerInfoBean serverItem,
+  ) async {
+    if (_serverTapLocked) return;
+    _serverTapLocked = true;
+    _loginCancelled = false;
+    _tapCancelCompleter = Completer<void>();
+    _tappingServerItem = serverItem;
+    _showTapLoadingDialog(context);
+    try {
+      final hasPairCode = (serverItem.pairCode ?? '').trim().isNotEmpty;
+      final hasDirectUrl =
+          serverItem.serverUrl.trim().isNotEmpty &&
+          serverItem.serverUrl.trim() != ApiController.p2pBaseUrl;
+
+      try {
+        ServerStatusResponse? status;
+        var usingP2p = false;
+
+        // ── 直连候选（serverUrl 优先，lanIpv4 兜底）──
+        // 注：蜂窝网络下不跳过私网 IP——组网软件（Tailscale/ZeroTier 等）会在
+        // 蜂窝下经虚拟网卡私网 IP 直连，跳过会误伤该场景；不可达时 800ms 探测
+        // 超时由并行 P2P 建连掩盖，不增加总耗时
+        final directCandidates = <({String url, bool requireServerIdMatch})>[];
+        if (hasDirectUrl) {
+          final serverUrl = serverItem.serverUrl.trim();
+          directCandidates.add((url: serverUrl, requireServerIdMatch: false));
+          if (hasPairCode) {
+            final lan = (serverItem.lanIpv4 ?? '').trim();
+            final port = _resolveHttpPort(serverItem);
+            final lanUrl = lan.isNotEmpty ? 'http://$lan:$port' : '';
+            final lanAlreadyTried =
+                lanUrl.isNotEmpty &&
+                _normalizeUrl(lanUrl) == _normalizeUrl(serverUrl);
+            if (lan.isNotEmpty && !lanAlreadyTried) {
+              directCandidates.add((url: lanUrl, requireServerIdMatch: true));
+            }
+          }
+        }
+
+        if (directCandidates.isNotEmpty && hasPairCode) {
+          // ═══════════════════════════════════════════════════
+          // Phase 1+2 并行：LAN 直连探测与 P2P 建连同时进行，先成功者胜
+          // ═══════════════════════════════════════════════════
+          // 直连探测用 checkServerStatusAt 独立请求（不动全局 baseUrl），
+          // 与 P2P 建连内部的 setBaseUrl(p2p.local) 无竞争；
+          // LAN 可达时约 0.8s 内胜出（无需先等 P2P 或串行二次探测），
+          // LAN 不可达时 P2P 已并行建连约 1.6s，省去原串行流程的 4s 等待
+          final p2pReusable = _isP2pReusableFor(serverItem);
+
+          final decided = Completer<void>();
+          String? lanWinUrl;
+          ServerStatusResponse? lanWinStatus;
+          var p2pWon = false;
+          var lanDone = false;
+          var p2pDone = p2pReusable;
+          var p2pFailed = false;
+          Object? p2pError;
+
+          void settle() {
+            if (decided.isCompleted) return;
+            if (lanWinUrl != null) {
+              decided.complete(); // LAN 命中即胜（可复用 P2P 保留，LAN 优先）
+            } else if (lanDone) {
+              // LAN 探测已结束且未命中：P2P 就绪则胜，双败则收尾
+              if (p2pReusable || (p2pDone && !p2pFailed)) {
+                p2pWon = true;
+                decided.complete();
+              } else if (p2pDone && p2pFailed) {
+                decided.complete();
+              }
+            } else if (!p2pReusable && p2pDone && !p2pFailed) {
+              // LAN 尚未出结果而 P2P 先连上：谁先通用谁
+              p2pWon = true;
+              decided.complete();
+            }
+          }
+
+          // LAN 探测任务：逐候选独立请求（800ms/个，失败不抛）
+          unawaited(() async {
+            for (final c in directCandidates) {
+              try {
+                final s = await AuthApiService.instance.checkServerStatusAt(
+                  c.url,
+                  timeout: const Duration(milliseconds: 800),
+                );
+                if (s.success &&
+                    s.isNasCabServer &&
+                    (!c.requireServerIdMatch || _matchServerId(s, serverItem))) {
+                  lanWinUrl = c.url;
+                  lanWinStatus = s;
+                  break;
+                }
+              } catch (_) {}
+            }
+            lanDone = true;
+            settle();
+          }());
+
+          // P2P 建连任务（已可复用则无需启动；在途同码经建连队列排队短路）
+          if (!p2pReusable) {
+            unawaited(() async {
+              try {
+                await _ensureP2pConnected(serverItem);
+                p2pFailed = !ApiController.instance.isP2pReady;
+              } catch (e) {
+                p2pError = e;
+                p2pFailed = true;
+              } finally {
+                p2pDone = true;
+                settle();
+              }
+            }());
+          } else {
+            settle();
+          }
+
+          await Future.any<void>([
+            decided.future,
+            _tapCancelCompleter!.future,
+          ]);
+          if (_loginCancelled) {
+            return;
+          }
+          if (p2pWon) {
+            usingP2p = true;
+            ApiController.instance.setBaseUrl(ApiController.p2pBaseUrl);
+            status = await Future.any<ServerStatusResponse?>([
+              AuthApiService.instance.checkServerStatus(
+                false,
+                timeout: const Duration(seconds: 3),
+                maxRetries: 0,
+              ),
+              _tapCancelCompleter!.future.then((_) => null),
+            ]);
+            if (_loginCancelled) {
+              return;
+            }
+          } else if (lanWinUrl != null) {
+            // LAN 胜：作废在途 P2P 建连（token 递增使其在检查点自行中止）；
+            // 已就绪的同码 P2P 连接保留，供后续复用
+            if (!ApiController.instance.isP2pReady) {
+              await ApiController.instance.disconnectP2p().catchError((_) {});
+            }
+            ApiController.instance.setBaseUrl(lanWinUrl!);
+            status = lanWinStatus;
+          } else {
+            // 双败：优先抛 P2P 错误（含具体失败原因），走统一错误弹窗
+            throw p2pError ?? Exception('server_connect_fail');
+          }
+        } else if (directCandidates.isNotEmpty) {
+          // ═══════════════════════════════════════════════════
+          // 仅直连（无配对码）：独立探测，胜者设为全局 baseUrl
+          // ═══════════════════════════════════════════════════
+          if (!_isP2pReusableFor(serverItem) &&
+              !_isP2pConnectInFlightFor(serverItem)) {
+            await ApiController.instance.disconnectP2p().catchError((_) {});
+          }
+          for (final c in directCandidates) {
+            if (_loginCancelled) {
+              return;
+            }
+            final s = await Future.any<ServerStatusResponse?>([
+              AuthApiService.instance.checkServerStatusAt(
+                c.url,
+                timeout: const Duration(seconds: 2),
+              ),
+              _tapCancelCompleter!.future.then((_) => null),
+            ]);
+            if (_loginCancelled) {
+              return;
+            }
+            if (s != null &&
+                s.success &&
+                s.isNasCabServer &&
+                (!c.requireServerIdMatch || _matchServerId(s, serverItem))) {
+              status = s;
+              ApiController.instance.setBaseUrl(c.url);
+              break;
+            }
+          }
+        } else if (hasPairCode) {
+          // ═══════════════════════════════════════════════════
+          // 仅 P2P（无可用直连地址，如蜂窝网络 + 私有 IP）
+          // ═══════════════════════════════════════════════════
+          usingP2p = true;
+          if (_isP2pReusableFor(serverItem)) {
+            // 复用 Failover 已建好的同配对码就绪连接，跳过断开与全量重建。
+            // 注：走 connectP2pByPairCode 短路虽会直接返回，但会重置
+            // transportKind 且不恢复 baseUrl，故这里直接切到 P2P 通道
+            ApiController.instance.setBaseUrl(ApiController.p2pBaseUrl);
+          } else {
+            // 同配对码建连进行中（如配对码添加流程）：不断开，
+            // _ensureP2pConnected 经建连队列等待其完成后短路复用或原样重建
+            if (!_isP2pConnectInFlightFor(serverItem)) {
+              await ApiController.instance.disconnectP2p().catchError((_) {});
+            }
+            await _ensureP2pConnected(serverItem);
+            if (_loginCancelled) {
+              return;
+            }
+          }
+          status = await Future.any<ServerStatusResponse?>([
+            AuthApiService.instance.checkServerStatus(
+              false,
+              timeout: const Duration(seconds: 3),
+              maxRetries: 0,
+            ),
+            _tapCancelCompleter!.future.then((_) => null),
+          ]);
+          if (_loginCancelled) {
+            return;
+          }
+        }
+
+        if (status == null || !status.success || !status.isNasCabServer) {
+          _showErrorDialog('server_connect_fail'.tr);
+          return;
+        }
+
+        if (_loginCancelled) {
+          return;
+        }
+
+        final hasSuperAdmin = status.serverData?['hasSuperAdmin'] ?? false;
+        if (!hasSuperAdmin) {
+          DialogUtil.showConfirmDialog(
+            title: 'server_init'.tr,
+            content: 'server_init_content'.tr,
+            onConfirm: () => goToCreateAdminView(serverItem),
+            confirmText: 'ok'.tr,
+            cancelText: 'cancel'.tr,
+          );
+          return;
+        }
+
+        if (serverItem.isAutoScanned) {
+          if (usingP2p) {
+            serverItem.serverId =
+                status.serverData?['serverId'] ?? serverItem.serverId;
+            serverItem.serverHostName =
+                status.serverData?['hostname'] ?? serverItem.serverHostName;
+            serverItem.serverPlatform =
+                status.serverData?['platform'] ?? serverItem.serverPlatform;
+            serverItem.serverPortHttp =
+                status.serverData?['httpPort']?.toString() ??
+                serverItem.serverPortHttp;
+            serverItem.serverPortHttps =
+                status.serverData?['httpsPort']?.toString() ??
+                serverItem.serverPortHttps;
+          }
+          goToAddServerView(serverItem);
+          return;
+        }
+
+        if (serverItem.needInputPwdEveryTime) {
+          _dismissTapLoadingDialog();
+          final password = await DialogUtil.showPasswordInputDialogForResult(
+            title: 'server_login_password_required'.tr,
+            message: 'server_login_password_required_message'.tr,
+            hintText: 'auth_password_hint'.tr,
+          );
+          if (password == null || password.trim().isEmpty) {
+            return;
+          }
+          if (!_showTapLoadingDialogFromOverlay()) {
+            return;
+          }
+          await loginToServer(
+            serverItem,
+            baseUrlOverride: usingP2p ? ApiController.p2pBaseUrl : null,
+            passwordOverride: password.trim(),
+            persistPasswordOverride: false,
+          );
+          return;
+        }
+
+        await loginToServer(
+          serverItem,
+          baseUrlOverride: usingP2p ? ApiController.p2pBaseUrl : null,
+        );
+      } finally {
+        _dismissTapLoadingDialog();
+      }
+    } catch (e) {
+      _dismissTapLoadingDialog();
+      // 用户主动取消：静默收尾，不弹错误框（P2P断连会抛 p2p_connect_cancelled 等）
+      if (_loginCancelled) {
+        return;
+      }
+      _showErrorDialog(
+        ApiController.shouldFormatAsP2pConnectError(e)
+            ? ApiController.formatP2pConnectError(e)
+            : 'server_status_check_failed_with_error'.trParams({'error': '$e'}),
+      );
+    } finally {
+      _serverTapLocked = false;
+    }
+  }
+
+  /// 从 ServerInfoBean 解析 HTTP 端口（优先 httpPort，其次 httpsPort，默认 9000）
+  String _resolveHttpPort(ServerInfoBean serverItem) {
+    final httpPort = serverItem.serverPortHttp.trim();
+    if (httpPort.isNotEmpty) return httpPort;
+    final httpsPort = serverItem.serverPortHttps.trim();
+    if (httpsPort.isNotEmpty) return httpsPort;
+    return '9000';
+  }
+
+  /// 校验 checkServerStatus 返回的 serverId 是否与 serverItem 匹配
+  bool _matchServerId(
+    ServerStatusResponse status,
+    ServerInfoBean serverItem,
+  ) {
+    if (!status.success || !status.isNasCabServer) return false;
+    final statusServerId =
+        (status.serverData?['serverId']?.toString() ?? '').trim();
+    final itemServerId = serverItem.serverId.trim();
+    if (statusServerId.isEmpty || itemServerId.isEmpty) return false;
+    return statusServerId == itemServerId;
+  }
+
+  /// 对话框展示用服务器名称：自定义名称 → 主机名 → 地址 → 默认名
+  String _serverDisplayName(ServerInfoBean? s) {
+    final n = s?.serverName.trim() ?? '';
+    if (n.isNotEmpty) return n;
+    final h = s?.displayHostName.trim() ?? '';
+    if (h.isNotEmpty) return h;
+    final u = s?.serverUrl.trim() ?? '';
+    if (u.isNotEmpty) return u;
+    return 'NasCab Server';
+  }
+
+  /// 登录信息条目：小号标签在上，值在下（长 URL/配对码自动省略）
+  Widget _buildLoginInfoItem(
+    ThemeData theme,
+    String label,
+    String value, {
+    bool dimmed = false,
+  }) {
+    final colorScheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: colorScheme.onSurface.withValues(alpha: 0.5),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w500,
+              color: dimmed
+                  ? colorScheme.onSurface.withValues(alpha: 0.35)
+                  : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLoginInfoDivider(ColorScheme colorScheme) {
+    return Divider(
+      height: 1,
+      thickness: 0.6,
+      color: colorScheme.onSurface.withValues(alpha: 0.08),
+    );
+  }
+
+  void _showTapLoadingDialog(BuildContext context) {
+    if (_tapLoadingActive) return;
+    _tapLoadingActive = true;
+    _tapLoadingProgrammaticDismiss = false;
+    final token = ++_tapLoadingToken;
+
+    // 记录 route 以便精确移除：dismiss 时若用 Navigator.pop() 会盲 pop 栈顶，
+    // 当错误弹窗/确认弹窗/新页面先于 finally 入栈时，会把它们误关而 loading 永久残留
+    // （表现为界面一直显示"正在登录"卡死）
+    final route = DialogRoute<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        _tapLoadingDialogContext = dialogContext;
+        final theme = Theme.of(dialogContext);
+        final colorScheme = theme.colorScheme;
+        final server = _tappingServerItem;
+
+        final name = _serverDisplayName(server);
+        final url = server?.serverUrl.trim() ?? '';
+        final pair = (server?.pairCode ?? '').trim();
+        final user = (server?.username ?? '').trim();
+        final platform = server?.getPlatformFriendlyName() ?? '';
+        final host = server?.displayHostName.trim() ?? '';
+        final subtitle = [
+          host.isNotEmpty ? host : null,
+          (platform.isNotEmpty && platform != 'unknown') ? platform : null,
+        ].whereType<String>().join(' · ');
+
+        final screenWidth = MediaQuery.sizeOf(dialogContext).width;
+        // 手机上取屏幕宽 80%（375px 屏约 300px）；PC 显示器 80% 会超过
+        // 1500px 反而显得过宽，因此与 300px 封顶取较小值
+        final dialogWidth =
+            screenWidth * 0.8 > 300 ? 300.0 : screenWidth * 0.8;
+
+        return Dialog(
+          insetPadding: const EdgeInsets.all(24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: SizedBox(
+            width: dialogWidth,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 12, 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 头部：服务器图标 + 名称 + 主机名/平台
+                  Row(
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: colorScheme.primary.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          server?.isLocalServer == true
+                              ? Icons.computer_rounded
+                              : pair.isNotEmpty
+                              ? Icons.cloud_rounded
+                              : Icons.dns_rounded,
+                          color: colorScheme.primary,
+                          size: 24,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            if (subtitle.isNotEmpty) ...[
+                              const SizedBox(height: 3),
+                              Text(
+                                subtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: colorScheme.onSurface.withValues(
+                                    alpha: 0.55,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  // 服务器详细信息
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colorScheme.surfaceContainerHighest.withValues(
+                        alpha: 0.45,
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _buildLoginInfoItem(
+                          theme,
+                          'server_add_address_label'.tr,
+                          url.isEmpty ? '—' : url,
+                          dimmed: url.isEmpty,
+                        ),
+                        _buildLoginInfoDivider(colorScheme),
+                        _buildLoginInfoItem(
+                          theme,
+                          'server_pair_code_label'.tr,
+                          pair.isEmpty ? '—' : pair,
+                          dimmed: pair.isEmpty,
+                        ),
+                        if (user.isNotEmpty) ...[
+                          _buildLoginInfoDivider(colorScheme),
+                          _buildLoginInfoItem(
+                            theme,
+                            'username'.tr,
+                            user,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  // 登录进度
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.4,
+                          color: colorScheme.primary,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'auth_login_loading'.tr,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  // 取消按钮单独一行横向居中，位置更醒目
+                  // 补右侧 8px 使本行左右内边距均为 20，保证视觉上严格居中
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Center(
+                      child: TextButton(
+                        onPressed: _cancelLogin,
+                        child: Text('cancel'.tr),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    _tapLoadingRoute = route;
+    Navigator.of(context, rootNavigator: true).push(route).then((_) {
+      if (_tapLoadingToken == token) {
+        final dismissedByUser =
+            !_tapLoadingProgrammaticDismiss && !_loginCancelled;
+        _tapLoadingActive = false;
+        _tapLoadingDialogContext = null;
+        // 点击遮罩/返回键关闭对话框等同取消登录
+        if (dismissedByUser) {
+          _cancelLogin();
+        }
+      }
+      if (identical(_tapLoadingRoute, route)) {
+        _tapLoadingRoute = null;
+      }
+    });
+  }
+
+  /// 取消本次登录：置取消标志、在各等待点立即放行，并作废在途 P2P 建连。
+  /// 仅当 P2P 与本次登录相关（在途建连或当前正走 P2P）时才断开，
+  /// 避免误伤 Failover 与其他服务器的连接。
+  void _cancelLogin() {
+    if (_loginCancelled) return;
+    _loginCancelled = true;
+    final completer = _tapCancelCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+    final tapping = _tappingServerItem;
+    if (tapping != null && (tapping.pairCode ?? '').trim().isNotEmpty) {
+      final api = ApiController.instance;
+      if (_isP2pConnectInFlightFor(tapping) || api.isP2pMode) {
+        unawaited(api.disconnectP2p().catchError((_) {}));
+      }
+    }
+    _dismissTapLoadingDialog();
+  }
+
+  bool _showTapLoadingDialogFromOverlay() {
+    final overlayContext = Get.overlayContext;
+    if (overlayContext == null) return false;
+    _showTapLoadingDialog(overlayContext);
+    return true;
+  }
+
+  void _dismissTapLoadingDialog() {
+    if (!_tapLoadingActive) return;
+    _tapLoadingActive = false;
+    _tapLoadingProgrammaticDismiss = true;
+    final ctx = _tapLoadingDialogContext;
+    _tapLoadingDialogContext = null;
+    // 优先精确移除自身 route，避免盲 pop 栈顶误关后弹的错误/确认弹窗或新页面
+    final route = _tapLoadingRoute;
+    _tapLoadingRoute = null;
+    if (route != null) {
+      try {
+        final navigator = route.navigator;
+        if (navigator != null) {
+          navigator.removeRoute(route);
+          return;
+        }
+      } catch (_) {}
+    }
+    if (ctx == null) return;
+    try {
+      final navigator = Navigator.of(ctx, rootNavigator: true);
+      if (navigator.canPop()) {
+        navigator.pop();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> addServerByPairCode() async {
+    final context = Get.overlayContext;
+    if (context == null) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) => const _PairCodeConnectDialog(),
+    );
+  }
+
+  /// 当前 P2P 连接是否可直接复用：已就绪且配对码与目标服务器一致。
+  ///
+  /// 点击流程（直连/局域网探测、P2P 探测）期间，若 Failover 已建好同配对码的
+  /// 就绪连接，则保留并复用，避免「先拆后建」竞态：拆除刚建好的连接再做全量
+  /// 重建，重建期间任何抖动都会放大为「P2P 通道连接失败」。
+  /// 直连探测按 baseUrl 路由，保留 P2P 连接不影响直连探测结果。
+  bool _isP2pReusableFor(ServerInfoBean serverItem) {
+    final code = (serverItem.pairCode ?? '').trim();
+    if (code.isEmpty) return false;
+    final api = ApiController.instance;
+    return api.isP2pReady && api.p2pPairCode.trim() == code;
+  }
+
+  /// 同配对码的 P2P 建连是否正在进行（如配对码添加流程、自动重连在建）。
+  ///
+  /// 此时点击流程同样不应断开：_ensureP2pConnected 经建连队列排队等待其完成，
+  /// 成功则短路复用、失败则原样重建；若先 disconnect 会把即将就绪的连接拆掉
+  /// （表现为 p2p_rtc_init_failed_p2p_closed），重建期抖动即「P2P 通道连接失败」。
+  bool _isP2pConnectInFlightFor(ServerInfoBean serverItem) {
+    final code = (serverItem.pairCode ?? '').trim();
+    if (code.isEmpty) return false;
+    final api = ApiController.instance;
+    // 覆盖 session/create HTTP 窗口与建连队列排队阶段：
+    // 此时 _p2pChannel 尚未赋值（isP2pEnabled=false），旧检测存在盲区
+    if (api.isP2pConnectAttemptInFlight &&
+        api.p2pConnectingPairCode.trim() == code) {
+      return true;
+    }
+    return !api.isP2pReady &&
+        api.isP2pEnabled &&
+        api.p2pPairCode.trim() == code;
+  }
+
+  Future<void> _ensureP2pConnected(ServerInfoBean serverItem) async {
+    final code = (serverItem.pairCode ?? '').trim();
+    if (code.isEmpty) {
+      throw Exception('pair_code_empty');
+    }
+    // 遇到 P2P_DEVICE_OFFLINE 时重试，设备可能处于重连信令服务器的短暂窗口期
+    const maxRetries = 3;
+    const retryDelay = Duration(milliseconds: 1500);
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // 不显式传 ICE 偏好：connectP2pByPairCode 入口按开发连接模式恢复
+        // （p2pDirect→directOnly、p2pRelay→relayOnly、其余→auto），与配对码
+        // 添加/自动重连口径一致。此前硬编码 auto 会绕过强制中继/强制直连
+        // 设置，出现「点击连接实际直连、断线裸重连又变强制中继」的偏好翻转
+        await ApiController.instance.connectP2pByPairCode(code);
+        return;
+      } catch (e) {
+        final isOfflineError = e.toString().contains('P2P_DEVICE_OFFLINE');
+        if (isOfflineError && attempt < maxRetries) {
+          await Future<void>.delayed(retryDelay);
+          continue;
+        }
+        rethrow;
+      }
+    }
+  }
+
+  /// 标准化 URL 用于比较（去除末尾斜杠、统一小写 scheme+host）
+  String _normalizeUrl(String url) {
+    try {
+      final uri = Uri.tryParse(url.trim());
+      if (uri == null) return url.trim().toLowerCase();
+      final scheme = uri.scheme.toLowerCase();
+      final host = uri.host.toLowerCase();
+      final port = uri.hasPort ? ':${uri.port}' : '';
+      final path = uri.path.replaceAll(RegExp(r'/+$'), '');
+      return '$scheme://$host$port$path';
+    } catch (_) {
+      return url.trim().toLowerCase();
+    }
+  }
+
+  /// 显示错误对话框
+  void _showErrorDialog(String message) {
+    DialogUtil.showErrorDialog(message: message, title: 'error'.tr);
+  }
+
+  ServerInfoBean _buildLoginRequestServer(
+    ServerInfoBean serverItem, {
+    String? passwordOverride,
+  }) {
+    return ServerInfoBean(
+      serverId: serverItem.serverId,
+      serverUrl: serverItem.serverUrl,
+      userInputUrl: serverItem.userInputUrl,
+      lanIpv4: serverItem.lanIpv4,
+      lanHttpPort: serverItem.lanHttpPort,
+      lanHttpsPort: serverItem.lanHttpsPort,
+      serverName: serverItem.serverName,
+      serverHost: serverItem.serverHost,
+      serverPortHttp: serverItem.serverPortHttp,
+      serverPortHttps: serverItem.serverPortHttps,
+      serverHostName: serverItem.serverHostName,
+      customHostname: serverItem.customHostname,
+      serverPlatform: serverItem.serverPlatform,
+      isAutoScanned: serverItem.isAutoScanned,
+      isLocalServer: serverItem.isLocalServer,
+      isP2p: serverItem.isP2p,
+      pairCode: serverItem.pairCode,
+      username: serverItem.username,
+      password: passwordOverride ?? serverItem.password,
+      accessToken: serverItem.accessToken,
+      refreshToken: serverItem.refreshToken,
+      lastLoginTime: serverItem.lastLoginTime,
+      needInputPwdEveryTime: serverItem.needInputPwdEveryTime,
+    );
+  }
+
+  /// 显示密码输入对话框
+  void _showPasswordInputDialog(
+    ServerInfoBean serverItem, {
+    String? title,
+    String? message,
+    bool persistPassword = true,
+    String? baseUrlOverride,
+  }) {
+    DialogUtil.showPasswordInputDialog(
+      title: title ?? 'auth_password_error'.tr,
+      message: message ?? 'auth_password_error_message'.tr,
+      hintText: 'auth_password_hint'.tr,
+      onConfirm: (String newPassword) {
+        loginToServer(
+          serverItem,
+          baseUrlOverride: baseUrlOverride,
+          passwordOverride: newPassword,
+          persistPasswordOverride: persistPassword,
+        );
+      },
+    );
+  }
+
+  /// 登录到服务器
+  Future<void> loginToServer(
+    ServerInfoBean serverItem, {
+    String? baseUrlOverride,
+    String? passwordOverride,
+    bool? persistPasswordOverride,
+  }) async {
+    try {
+      if (baseUrlOverride != null && baseUrlOverride.trim().isNotEmpty) {
+        ApiController.instance.setBaseUrl(baseUrlOverride.trim());
+      } else if (!ApiController.instance.isP2pMode) {
+        final url = serverItem.serverUrl.trim();
+        if (url.isNotEmpty) {
+          ApiController.instance.setBaseUrl(url);
+        }
+      }
+      final requestServer = _buildLoginRequestServer(
+        serverItem,
+        passwordOverride: passwordOverride,
+      );
+      final loginResult = await AuthApiService.instance.loginToServer(
+        requestServer,
+        showLoading: false,
+      );
+      // 请求返回前用户已取消：静默丢弃结果（服务端可能已登录成功，下次点击会重新登录）
+      if (_loginCancelled) {
+        return;
+      }
+      if (loginResult.success) {
+        if (loginResult.twoFactorRequired == true &&
+            (loginResult.tempToken ?? '').isNotEmpty) {
+          _dismissTapLoadingDialog();
+          _showTwofaDialog(
+            requestServer,
+            loginResult.tempToken!,
+            persistPassword:
+                persistPasswordOverride ?? !serverItem.needInputPwdEveryTime,
+          );
+          return;
+        }
+        // 登录成功，更新服务器信息
+        await _handleLoginSuccess(
+          serverItem,
+          loginResult,
+          passwordToPersist:
+              (persistPasswordOverride ?? !serverItem.needInputPwdEveryTime)
+              ? requestServer.password
+              : '',
+        );
+      } else {
+        if (_loginCancelled) {
+          return;
+        }
+        if (loginResult.code == 999) {
+          // 密码错误，弹出带输入框的密码输入框
+          _dismissTapLoadingDialog();
+          _showPasswordInputDialog(
+            serverItem,
+            persistPassword:
+                persistPasswordOverride ?? !serverItem.needInputPwdEveryTime,
+            baseUrlOverride: baseUrlOverride,
+          );
+        } else {
+          _dismissTapLoadingDialog();
+          _showErrorDialog('${loginResult.message}');
+        }
+      }
+    } catch (e) {
+      // 关闭loading对话框
+      _dismissTapLoadingDialog();
+      if (_loginCancelled) {
+        return;
+      }
+      _showErrorDialog('${'auth_login_failure'.tr}: $e');
+    }
+  }
+
+  void _showTwofaDialog(
+    ServerInfoBean serverItem,
+    String tempToken, {
+    bool persistPassword = true,
+  }) {
+    if (Get.overlayContext == null) return;
+    showDialog(
+      context: Get.overlayContext!,
+      barrierDismissible: false,
+      builder: (_) => TwofaCodeDialog(
+        onVerify: (code) {
+          Get.back();
+          _submitTwoFactor(
+            serverItem,
+            tempToken,
+            code,
+            persistPassword: persistPassword,
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _submitTwoFactor(
+    ServerInfoBean serverItem,
+    String tempToken,
+    String code, {
+    bool persistPassword = true,
+  }) async {
+    DialogUtil.showLoadingDialog(
+      message: 'auth_login_loading'.tr,
+      barrierDismissible: false,
+    );
+    try {
+      final verifyResult = await AuthApiService.instance.verifyTwoFactorLogin(
+        tempToken: tempToken,
+        code: code,
+      );
+      Get.back();
+      if (!verifyResult.success) {
+        _showErrorDialog(verifyResult.message ?? 'auth_login_failure'.tr);
+        return;
+      }
+      await _handleLoginSuccess(
+        serverItem,
+        verifyResult,
+        passwordToPersist: persistPassword ? serverItem.password : '',
+      );
+    } catch (e) {
+      Get.back();
+      _showErrorDialog('${'auth_login_failure'.tr}: $e');
+    }
+  }
+
+  Future<void> _handleLoginSuccess(
+    ServerInfoBean serverItem,
+    LoginResponse loginResult, {
+    String? passwordToPersist,
+  }) async {
+    _dismissTapLoadingDialog();
+    serverItem.password = passwordToPersist ?? serverItem.password;
+    serverItem.accessToken = loginResult.accessToken;
+    serverItem.serverId = loginResult.serverId ?? 'unknown';
+    serverItem.serverPlatform = loginResult.platform ?? 'unknown';
+    serverItem.serverHostName = loginResult.hostname ?? 'unknown';
+    final ch = loginResult.customHostname?.trim();
+    serverItem.customHostname = (ch == null || ch.isEmpty) ? null : ch;
+    serverItem.refreshToken = loginResult.refreshToken;
+    serverItem.serverPortHttp = loginResult.httpPort?.toString() ?? '';
+    serverItem.serverPortHttps = loginResult.httpsPort?.toString() ?? '';
+    final pair = (loginResult.pairCode ?? '').trim();
+    if (pair.isNotEmpty) {
+      serverItem.pairCode = pair;
+    }
+    final lan = (loginResult.lanIpv4 ?? '').trim();
+    if (lan.isNotEmpty) {
+      serverItem.lanIpv4 = lan;
+      serverItem.lanHttpPort = loginResult.httpPort?.toString() ?? '';
+      serverItem.lanHttpsPort = loginResult.httpsPort?.toString() ?? '';
+      final currentUrl = serverItem.serverUrl.trim();
+      if (currentUrl.isEmpty) {
+        serverItem.serverUrl = _buildLanServerUrl(
+          lan,
+          loginResult.httpPort?.toString(),
+          loginResult.httpsPort?.toString(),
+        );
+        if ((serverItem.pairCode ?? '').trim().isEmpty &&
+            (serverItem.userInputUrl ?? '').trim().isEmpty) {
+          serverItem.userInputUrl = serverItem.serverUrl;
+        }
+      }
+    }
+    serverItem.isP2p =
+        serverItem.serverUrl.trim().isEmpty &&
+        (serverItem.pairCode ?? '').trim().isNotEmpty;
+    await ServerStorageService.addServer(serverItem);
+    await refreshSavedServers();
+
+    ApiController.instance.setAuthInfo(
+      serverId: serverItem.serverId,
+      accessToken: loginResult.accessToken!,
+      refreshToken: loginResult.refreshToken!,
+      expiresIn: loginResult.expiresIn!,
+      shellSupported: loginResult.shellSupported ?? false,
+      httpsPort: loginResult.httpsPort?.toString(),
+      serverPlatform: loginResult.platform ?? serverItem.serverPlatform,
+      serverVersion: loginResult.serverVersion,
+      serverHostname: loginResult.hostname ?? serverItem.serverHostName,
+      customHostname: serverItem.customHostname,
+    );
+
+    // 登录成功且当前走 P2P 时，后台探测直连并尝试从中继无缝升级为直连
+    if (ApiController.instance.isP2pMode) {
+      ApiController.instance.scheduleP2pDirectUpgrade();
+    }
+
+    await SessionWallpaperBackground.preloadForCurrentSession();
+
+    // 异步检测客户端与服务器是否在同一台机器（本地127.0.0.1探测 + Web hostname fallback）
+    unawaited(
+      _checkAndSetSameMachine(
+        serverItem.serverId,
+        serverItem.serverHostName,
+        serverItem.lanIpv4,
+      ),
+    );
+
+    print('22服务器登录成功: ${loginResult.toString()}');
+    await stopUdpListening();
+    Get.offAllNamed(AppRoutes.home);
+    if (Get.isRegistered<LocalBackupController>()) {
+      print(
+        '[Login] 调用 LocalBackupController.restartRealtimeWatchersForCurrentServer',
+      );
+      Get.find<LocalBackupController>()
+          .restartRealtimeWatchersForCurrentServer();
+    } else {
+      print('[Login] LocalBackupController 未注册，跳过实时备份启动');
+    }
+  }
+
+  /// 当本机无服务器地址时，用登录返回的 lanIpv4 + 端口拼接为服务器地址
+  String _buildLanServerUrl(
+    String lanIpv4,
+    String? httpPort,
+    String? httpsPort,
+  ) {
+    final lan = lanIpv4.trim();
+    if (lan.isEmpty) return '';
+    final port = (httpPort ?? '').trim().isNotEmpty
+        ? httpPort!.trim()
+        : ((httpsPort ?? '').trim().isNotEmpty ? httpsPort!.trim() : '9000');
+    return 'http://$lan:$port';
+  }
+
+  /// 处理菜单选择
+  void handleMenuSelection(String value, ServerInfoBean serverItem) {
+    switch (value) {
+      case 'edit_pair_code':
+        _showEditPairCodeDialog(serverItem);
+        break;
+      case 'edit':
+        // 显示添加服务器页面
+        goToAddServerView(serverItem);
+        break;
+      case 'recover':
+        // 显示忘记密码页面
+        goToRecover(serverItem);
+        break;
+      case 'remote_connect_pref':
+        // 远程连接偏好设置
+        unawaited(showRemoteConnectPref(serverItem));
+        break;
+      case 'auto_login':
+        // 启动时自动登录（全局互斥）
+        unawaited(toggleAutoLogin(serverItem));
+        break;
+      case 'move_to_top':
+        // 移动到列表顶部
+        unawaited(moveServerToTop(serverItem));
+        break;
+      case 'delete':
+        print('删除服务器: ${serverItem.serverName}');
+        _showDeleteConfirmDialog(serverItem);
+        break;
+    }
+  }
+
+  /// 服务器级「远程连接偏好」设置弹窗（P2P直连优先 / P2P中继优先）。
+  ///
+  /// 偏好随服务器条目持久化；此后所有 null 偏好建连（点击服务器、自动重连、
+  /// Failover 切换）都会在 connectP2pByPairCode 入口按此偏好解析为强制中继，
+  /// 保证「任何时候都优先走中继」。若当前已以 P2P 连接该服务器，则立即按
+  /// 新偏好断开重建（同配对码就绪连接会被短路复用，必须先断开才会真正重建），
+  /// 重建期间常见请求瞬时失败属预期。
+  Future<void> showRemoteConnectPref(ServerInfoBean item) async {
+    final code = (item.pairCode ?? '').trim();
+    if (code.isEmpty) return;
+    final ctx = Get.overlayContext;
+    if (ctx == null) return;
+    final relayPreferred = item.p2pRelayPreferred;
+    final selected = await showDialog<bool>(
+      context: ctx,
+      builder: (dialogContext) {
+        return SimpleDialog(
+          title: Text(
+            '${'server_remote_connect_pref'.tr}'
+            '${'remote_pref_pair_code_hint'.tr}',
+          ),
+          children: [
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    (relayPreferred ? '' : '✓ ') +
+                        'remote_pref_direct_first'.tr,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'remote_pref_direct_first_desc'.tr,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(dialogContext)
+                          .colorScheme
+                          .onSurface
+                          .withValues(alpha: 0.6),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    (relayPreferred ? '✓ ' : '') +
+                        'remote_pref_relay_first'.tr,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'remote_pref_relay_first_desc'.tr,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(dialogContext)
+                          .colorScheme
+                          .onSurface
+                          .withValues(alpha: 0.6),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+    // 未选择或与当前值相同：仅关窗返回
+    if (selected == null || selected == relayPreferred) return;
+
+    // 更新内存值并持久化：在已保存列表中按身份定位更新（未保存的发现项
+    // 仅更新内存值即可），随后刷新列表 UI
+    item.p2pRelayPreferred = selected;
+    try {
+      final saved = ServerStorageService.loadServers();
+      var persisted = false;
+      for (var i = 0; i < saved.length; i++) {
+        if (ServerStorageService.isSameIdentity(saved[i], item)) {
+          saved[i].p2pRelayPreferred = selected;
+          persisted = true;
+          break;
+        }
+      }
+      if (persisted) {
+        await ServerStorageService.saveServers(saved);
+      }
+    } catch (_) {}
+    await refreshSavedServers();
+
+    // 当前正以 P2P 连接该服务器时，立即按新偏好重建
+    final api = ApiController.instance;
+    if (api.isP2pMode && api.p2pPairCode.trim() == code) {
+      try {
+        await api.disconnectP2p();
+        await api.connectP2pByPairCode(
+          code,
+          icePreference: selected
+              ? P2pIcePreference.relayOnly
+              : P2pIcePreference.auto,
+        );
+      } catch (e) {
+        ToastUtil.show(ApiController.formatP2pConnectError(e));
+      }
+    }
+  }
+
+  /// 将指定已保存服务器移动到列表顶部，并持久化新顺序。
+  ///
+  /// 顺序由持久化数组本身承载（无需额外排序字段）；加载时 addLocalSignToServerList
+  /// 仅做「本机在前」的稳定分区，不会打乱其余项的持久化相对顺序。
+  Future<void> moveServerToTop(ServerInfoBean item) async {
+    try {
+      final saved = ServerStorageService.loadServers();
+      if (saved.length <= 1) return;
+      final index = saved.indexWhere(
+        (s) => ServerStorageService.isSameIdentity(s, item),
+      );
+      // 未找到（自动发现项不应出现此菜单）或已在顶部：无需处理
+      if (index <= 0) return;
+      final moved = saved.removeAt(index);
+      saved.insert(0, moved);
+      await ServerStorageService.saveServers(saved);
+      await refreshSavedServers();
+    } catch (e) {
+      print('❌ 移动服务器到顶部失败: $e');
+    }
+  }
+
+  /// 切换某服务器的「启动时自动登录」。
+  ///
+  /// 该选项在所有服务器中互斥：开启时先清空全部条目标志，再置目标为 true；
+  /// 关闭时仅清自身。随后刷新列表，菜单文案与 URL 左侧标识即时更新
+  Future<void> toggleAutoLogin(ServerInfoBean item) async {
+    final enable = !item.autoLoginOnStartup;
+    item.autoLoginOnStartup = enable;
+    try {
+      final saved = ServerStorageService.loadServers();
+      for (var i = 0; i < saved.length; i++) {
+        if (enable && ServerStorageService.isSameIdentity(saved[i], item)) {
+          saved[i].autoLoginOnStartup = true;
+        } else {
+          saved[i].autoLoginOnStartup = false;
+        }
+      }
+      await ServerStorageService.saveServers(saved);
+    } catch (e) {
+      print('❌ 切换启动自动登录失败: $e');
+    }
+    await refreshSavedServers();
+  }
+
+  Future<void> _showEditPairCodeDialog(ServerInfoBean serverItem) async {
+    if (Get.overlayContext == null) return;
+    final pairCode = await DialogUtil.showInputDialog(
+      title: 'server_edit_pair_code_title'.tr,
+      content: 'server_edit_pair_code_content'.tr,
+      initialValue: (serverItem.pairCode ?? '').trim(),
+      validator: (v) {
+        final s = v?.trim() ?? '';
+        if (s.isEmpty) return 'server_pair_code_empty'.tr;
+        if (s.length < 4) return 'server_pair_code_invalid'.tr;
+        if (s.length > 32) return 'server_pair_code_invalid'.tr;
+        return null;
+      },
+    );
+    final code = (pairCode ?? '').trim();
+    if (code.isEmpty) return;
+
+    serverItem.pairCode = code;
+    await ServerStorageService.addServer(serverItem);
+    await refreshSavedServers();
+  }
+
+  /// 显示删除确认对话框
+  void _showDeleteConfirmDialog(ServerInfoBean serverItem) {
+    final serverName = serverItem.serverName.isNotEmpty
+        ? serverItem.serverName
+        : serverItem.serverHostName;
+
+    DialogUtil.showConfirmDialog(
+      title: 'delete'.tr,
+      content: 'server_delete_confirm_message'.trParams({
+        'serverName': serverName,
+      }),
+      confirmText: 'delete'.tr,
+      cancelText: 'cancel'.tr,
+      onConfirm: () => _deleteServer(serverItem),
+    );
+  }
+
+  /// 删除服务器
+  void _deleteServer(ServerInfoBean serverItem) {
+    print('删除服务器: ${serverItem.serverName}');
+    // 调用视图模型删除服务器
+    deleteServer(serverItem);
+    // 刷新服务器列表
+    refreshSavedServers();
+  }
+
+  /// 开始UDP监听
+  Future<void> startUdpListening() async {
+    await stopUdpListening();
+    _udpListener.setOnServerDiscovered(_handleDiscoveredServer);
+    await _udpListener.startListening();
+  }
+
+  /// 停止UDP监听
+  Future<void> stopUdpListening() async {
+    await _udpListener.stopListening();
+  }
+
+  /// 加载已保存的服务器列表
+  Future<void> _loadSavedServers() async {
+    try {
+      final savedServers = ServerStorageService.loadServers();
+      savedServersRx.value = savedServers;
+      addLocalSignToServerList(savedServersRx);
+    } catch (e) {
+      print('❌ 加载已保存服务器列表失败: $e');
+    }
+  }
+
+  /// 刷新已保存的服务器列表（公共方法）
+  Future<void> refreshSavedServers() async {
+    await _loadSavedServers();
+    discoveredServersRx.removeWhere(
+      (server) => savedServersRx.any(
+        (savedServer) =>
+            ServerStorageService.isSameIdentity(savedServer, server),
+      ),
+    );
+  }
+
+  /// 根据id删除服务器（公共方法）
+  Future<void> deleteServer(ServerInfoBean serverItem) async {
+    ServerStorageService.removeServer(serverItem);
+  }
+
+  //去到忘记密码页面
+  void goToRecover(ServerInfoBean serverItem) {
+    ApiController.instance.setBaseUrl(serverItem.serverUrl);
+    Get.toNamed('/recover');
+  }
+
+  Future<void> confirmExitApp() async {
+    if (_exitDialogShowing) return;
+    _exitDialogShowing = true;
+    try {
+      if (Get.overlayContext == null) {
+        _exitApp();
+        return;
+      }
+      final result = await DialogUtil.showConfirmDialog(
+        title: 'server_list_exit_title'.tr,
+        content: 'server_list_exit_content'.tr,
+        confirmText: 'ok'.tr,
+        cancelText: 'cancel'.tr,
+        barrierDismissible: false,
+      );
+      if (result == true) {
+        _exitApp();
+      }
+    } finally {
+      _exitDialogShowing = false;
+    }
+  }
+
+  void _exitApp() {
+    if (kIsWeb) return;
+    try {
+      SystemNavigator.pop();
+    } catch (_) {}
+  }
+
+  @override
+  void onClose() {
+    _udpListener.stopListeningSync();
+    super.onClose();
+  }
+}
+
+/// 配对码添加：在对话框内完成校验与连接，仅成功后再关闭并进入添加服务器页。
+class _PairCodeConnectDialog extends StatefulWidget {
+  const _PairCodeConnectDialog();
+
+  @override
+  State<_PairCodeConnectDialog> createState() => _PairCodeConnectDialogState();
+}
+
+class _PairCodeConnectDialogState extends State<_PairCodeConnectDialog> {
+  final TextEditingController _controller = TextEditingController();
+  String? _fieldError;
+  String? _connectError;
+  bool _connecting = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_connecting) return;
+    final code = _controller.text.trim();
+    final validation = ApiController.validatePairCodeText(code);
+    if (validation != null) {
+      setState(() => _fieldError = validation);
+      return;
+    }
+    setState(() {
+      _connecting = true;
+      _fieldError = null;
+      _connectError = null;
+    });
+    try {
+      final status = await ApiController.instance
+          .connectP2pByPairCodeAndCheckServerStatus(
+            code,
+            timeout: const Duration(seconds: 20),
+          );
+      if (!mounted) return;
+      if (!status.success || !status.isNasCabServer) {
+        setState(() {
+          _connecting = false;
+          _connectError = 'server_connect_fail'.tr;
+        });
+        return;
+      }
+
+      final listCtrl = Get.find<ServerListController>();
+      final serverId = status.serverData?['serverId']?.toString() ?? '';
+      final matches = listCtrl.savedServersRx
+          .where((s) => s.serverId.trim().isNotEmpty && s.serverId == serverId)
+          .toList();
+      final preferred = matches.length == 1 ? matches.first : null;
+
+      final candidate = ServerInfoBean(
+        serverId: serverId,
+        serverUrl: '',
+        userInputUrl: '',
+        serverName: preferred?.serverName ?? 'NasCabServer',
+        serverHost: '',
+        serverPortHttp: status.serverData?['httpPort']?.toString() ?? '',
+        serverPortHttps: status.serverData?['httpsPort']?.toString() ?? '',
+        serverHostName: status.serverData?['hostname']?.toString() ?? '',
+        serverPlatform: status.serverData?['platform']?.toString() ?? 'unknown',
+        isAutoScanned: false,
+        isLocalServer: false,
+        isP2p: true,
+        pairCode: code,
+      );
+
+      Navigator.of(context).pop();
+      listCtrl.goToAddServerView(candidate);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _connectError = ApiController.formatP2pConnectError(e);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return PopScope(
+      canPop: !_connecting,
+      child: DialogUtil.createAlertDialog(
+        title: Text('server_add_by_pair_code_title'.tr),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(child: Text('server_add_by_pair_code_content'.tr)),
+                if (!kIsWeb && DeviceUtils.isMobile)
+                  TextButton(
+                    onPressed: _connecting
+                        ? null
+                        : () async {
+                            final scanned = await scanPairCodeQr(context);
+                            final v = (scanned ?? '').trim();
+                            if (v.isEmpty) return;
+                            final e = ApiController.validatePairCodeText(v);
+                            if (e == null) {
+                              _controller.text = v;
+                              setState(() => _fieldError = null);
+                              return;
+                            }
+                            ToastUtil.show('server_pair_code_scan_invalid'.tr);
+                          },
+                    child: Text('server_pair_code_scan_qr'.tr),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _controller,
+              enabled: !_connecting,
+              decoration: InputDecoration(
+                border: const OutlineInputBorder(),
+                errorText: _fieldError,
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+              ),
+              autofocus: true,
+              onChanged: (value) {
+                setState(() {
+                  _fieldError = ApiController.validatePairCodeText(value);
+                });
+              },
+            ),
+            if (_connecting) ...[
+              const SizedBox(height: 16),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.6,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'server_connecting'.tr,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            if (!_connecting && _connectError != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _connectError!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.error,
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            InkWell(
+              onTap: _connecting
+                  ? null
+                  : () {
+                      DialogUtil.showInfoDialog(
+                        title: 'server_pair_code_how_title'.tr,
+                        content: 'server_pair_code_how_content'.tr,
+                      );
+                    },
+              child: Text(
+                'server_pair_code_how_link'.tr,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: _connecting
+                      ? theme.colorScheme.onSurface.withValues(alpha: 0.38)
+                      : theme.colorScheme.primary,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: _connecting ? null : () => Navigator.of(context).pop(),
+            child: Text('cancel'.tr),
+          ),
+          TextButton(
+            onPressed: _connecting ? null : _submit,
+            child: Text('ok'.tr),
+          ),
+        ],
+      ),
+    );
+  }
+}
