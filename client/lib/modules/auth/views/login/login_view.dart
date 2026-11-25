@@ -281,10 +281,53 @@ class LoginView extends GetView<LoginController> {
                   ),
                 ),
               ),
+              _buildLanDirectHint(context, controller),
             ],
           ),
         ),
       ),
     );
+  }
+
+  /// 从公网/中继域名登录时，若服务端有可直连的内网或 P2P 地址，给一键切换入口。
+  /// 浏览器不允许 https 页面静默请求 http 内网地址，所以必须由用户点击做整页跳转。
+  Widget _buildLanDirectHint(BuildContext context, LoginController controller) {
+    return Obx(() {
+      final url = controller.lanDirectUrl.value.trim();
+      if (url.isEmpty) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
+        child: InkWell(
+          onTap: controller.jumpToLan,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.bolt_rounded,
+                  size: 15,
+                  color: Color(0xFF2EA043),
+                ),
+                const SizedBox(width: 4),
+                Flexible(
+                  child: Text(
+                    '局域网直连 ${controller.lanDirectLabel.value}（内网更快）',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF2EA043),
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
   }
 }

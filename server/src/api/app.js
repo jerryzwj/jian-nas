@@ -178,6 +178,10 @@ app.use('/api/tunnel', tunnelApi);
 const ddnsApi = require('./modules/others/ddns/ddnsRouter');
 app.use('/api/ddns', ddnsApi);
 
+// 系统信息（登录页需要预先拿到本机可直连地址，故意不鉴权）
+const systemApi = require('./modules/others/system/systemRouter');
+app.use('/api/system', systemApi);
+
 // 快速分享相关api
 const quickShareApi = require('./modules/quickShare/quickShareRouter');
 app.use('/api/quickShare', quickShareApi);

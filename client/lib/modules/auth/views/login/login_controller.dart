@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
+import '../../../../utils/lan_jump.dart';
 import '../../service/auth_api_service.dart';
 import '../../../../core/api/api_controller.dart';
 import '../../beans/server_info_bean.dart';
@@ -29,6 +32,11 @@ class LoginController extends GetxController {
   final isPairCodeConnecting = false.obs;
   final connectedHostName = ''.obs;
   final formKey = GlobalKey<FormState>();
+
+  /// 登录页"局域网直连"提示：从公网/中继域名进来时，若能直连内网或 P2P 网段，
+  /// 给出一个可点的一键切换地址（仅 Web 端展示，App 由 failover 自动处理）
+  final lanDirectUrl = ''.obs;
+  final lanDirectLabel = ''.obs;
 
   bool _loginInProgress = false;
 
@@ -65,7 +73,46 @@ class LoginController extends GetxController {
     if (!isCompanySite.value) {
       _loadLoginConfig();
       _checkServerInitStatusOnInit();
+      _loadLanDirect();
     }
+  }
+
+  /// 询问服务端有哪些可直连地址，优先 OpenP2P 虚拟网段（10.10.10.x），
+  /// 其次真实局域网；当前已在某个内网地址上访问时不提示。
+  Future<void> _loadLanDirect() async {
+    if (!kIsWeb) return;
+    try {
+      final origin = Uri.base.origin;
+      final resp = await http
+          .get(Uri.parse('$origin/api/system/lan-addresses'))
+          .timeout(const Duration(seconds: 3));
+      if (resp.statusCode != 200) return;
+      final data = jsonDecode(resp.body);
+      if (data is! Map) return;
+
+      final rawPort = (data['httpPort'] ?? '').toString().trim();
+      final port = rawPort.isNotEmpty ? rawPort : '6789';
+      List<String> toList(dynamic v) =>
+          (v is List) ? v.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toList() : <String>[];
+      final mesh = toList(data['meshIpv4List']);
+      final lan = toList(data['lanIpv4List']);
+      final currentHost = Uri.base.host;
+
+      for (final ip in [...mesh, ...lan]) {
+        if (ip == currentHost) continue;
+        lanDirectUrl.value = 'http://$ip:$port';
+        lanDirectLabel.value = mesh.contains(ip) ? '$ip（P2P 直连）' : '$ip（局域网）';
+        return;
+      }
+    } catch (_) {
+      // 忽略：拿不到就不提示
+    }
+  }
+
+  void jumpToLan() {
+    final url = lanDirectUrl.value.trim();
+    if (url.isEmpty) return;
+    jumpToLanOrigin(url);
   }
 
   Future<void> _loadLoginConfig() async {

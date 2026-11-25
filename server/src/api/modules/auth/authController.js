@@ -296,6 +296,7 @@ class AuthController {
       return a192 - b192;
     });
     const tunnelIpv4List = (ipAddresses || []).filter(ip => isTunnelIp(ip));
+    const meshIpv4List = tunnelIpv4List.slice(); // OpenP2P 等虚拟网段，客户端可直接优先使用
     const tunnelIpv4 = tunnelIpv4List.length > 0 ? String(tunnelIpv4List[0]) : '';
     const preferred = lanIpv4List[0];
     const lanIpv4 = preferred ? String(preferred) : (ipAddresses && ipAddresses[0] ? String(ipAddresses[0]) : '');
@@ -332,6 +333,7 @@ class AuthController {
         ...common,
         lanIpv4,
         lanIpv4List,
+        meshIpv4List,
         tunnelIpv4,
         publicIpv4,
         publicIpv6,
