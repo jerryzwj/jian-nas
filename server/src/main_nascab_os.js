@@ -128,6 +128,12 @@ function main() {
         }
       } catch (_) {}
       Logger.info('📡 App quitting, stopping singleton workers...');
+      // 先停 cloudflared 子进程，避免它留在后台变成孤儿（下次启动会由 syncAndStart 重新拉起）
+      try {
+        require('./services/cloudflareTunnelService').stop();
+      } catch (e) {
+        Logger.warn('stop cloudflared on quit failed', e && e.message);
+      }
       event.preventDefault();
       try {
         await singletonWorkerManager.gracefulShutdown();

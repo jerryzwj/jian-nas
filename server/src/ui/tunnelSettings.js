@@ -34,7 +34,11 @@ async function cfLoadStatus() {
   if (enableBtn) enableBtn.disabled = !s.hasToken;
 
   if (s.enabled && s.running) {
-    cfTip(`正常运行：${s.url}${s.lastService ? ` → ${s.lastService}` : ''}`, false);
+    if (s.conflict) {
+      cfTip(s.conflictHint || '检测到多台设备共用这条隧道，访问会随机串台', true);
+    } else {
+      cfTip(`正常运行：${s.url}${s.lastService ? ` → ${s.lastService}` : ''}`, false);
+    }
   } else if (s.enabled && !s.running) {
     cfTip(`已启用但进程未运行${s.lastError ? `：${s.lastError}` : ''}`, true);
   } else if (s.hostname) {
@@ -70,7 +74,7 @@ if (cfSubdomainInput) {
       if (r.available) {
         cfTip(`${r.hostname} 可用${r.owned ? '（当前隧道已占用，可继续使用）' : ''}`, false);
       } else {
-        cfTip(r.message || '该子域名已被占用', true);
+        cfTip(`${r.message || '该子域名已被占用'}，请换一个子域名`, true);
       }
     });
   }
@@ -83,6 +87,16 @@ if (cfSubdomainInput) {
       cfTip('正在创建隧道 / 写入 DNS / 启动 cloudflared…');
       const r = await window.electronAPI.enableTunnel({ subdomain: sub });
       if (!r || !r.success) {
+        // 子域名已被别的隧道/记录占用：不覆盖，直接让用户换一个
+        if (r && r.code === 'HOSTNAME_TAKEN') {
+          cfTip(r.message, true);
+          showToast('子域名已被占用，请换一个', 'error');
+          if (cfSubdomainInput) {
+            cfSubdomainInput.focus();
+            cfSubdomainInput.select();
+          }
+          return;
+        }
         cfTip((r && r.message) || '启用失败', true);
         showToast((r && r.message) || '启用失败', 'error');
         return;

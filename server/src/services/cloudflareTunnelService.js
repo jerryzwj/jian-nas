@@ -46,8 +46,11 @@ let lastError = '';
 let lastLog = '';
 let currentService = '';
 // Cloudflare 侧的真实连接状态（权威判断依据，避免只看本地进程导致误报）
-let remoteHealth = { status: 'unknown', connections: 0, checkedAt: 0, error: '' };
+// connectors = 去重后的 client_id 数量，即"有几台设备连在这条隧道上"（单台 cloudflared 的 4 条连接共用一个 client_id）
+let remoteHealth = { status: 'unknown', connections: 0, connectors: 0, checkedAt: 0, error: '' };
 let healthBusy = false;
+// 多 connector 首次出现的时刻：重启服务端时旧连接要几十秒才被回收，稳定 60 秒以上才算真冲突
+let conflictSince = 0;
 
 function configUtil() {
   return require('../config/config');
@@ -72,8 +75,12 @@ function loadConfig() {
 
 function saveConfig(cfg) {
   try {
+    const next = { ...cfg };
+    // 内置凭证只活在内存里，绝不写回配置文件（避免明文落到磁盘）
+    if (next.__builtinToken) next.apiToken = '';
+    delete next.__builtinToken;
     fs.mkdirSync(path.dirname(configPath()), { recursive: true });
-    fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2), 'utf8');
+    fs.writeFileSync(configPath(), JSON.stringify(next, null, 2), 'utf8');
   } catch (e) {
     Logger.error('保存隧道配置失败', e && e.message);
   }
@@ -127,9 +134,35 @@ function slug(value) {
     .slice(0, 20);
 }
 
+// 每台机器唯一的身份键：优先 Windows MachineGuid（不依赖业务数据，换机/拷配置都不会重复），
+// 取不到时回退主机名。用它给隧道命名，两台电脑就不会共用同一条隧道。
+let cachedMachineKey = '';
+function machineKey() {
+  if (cachedMachineKey) return cachedMachineKey;
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    const m = out.match(/([0-9a-fA-F]{8})-[0-9a-fA-F]{4}/);
+    if (m) {
+      cachedMachineKey = m[1].toLowerCase();
+      return cachedMachineKey;
+    }
+  } catch {
+    /* 非 Windows 或无权限，走主机名 */
+  }
+  try {
+    cachedMachineKey = slug(require('os').hostname()) || 'host';
+  } catch {
+    cachedMachineKey = 'host';
+  }
+  return cachedMachineKey;
+}
+
 function machineTunnelName() {
-  const os = require('os');
-  return `nascab-${slug(os.hostname()) || 'host'}`;
+  return `nascab-${machineKey()}`;
 }
 
 function assertSubdomain(sub) {
@@ -140,13 +173,34 @@ function assertSubdomain(sub) {
 }
 
 /**
- * 确保凭证可用：只要求配置文件里有 API Token，
+ * 配置文件没有 apiToken 时，注入内置凭证（加密存放，只在内存里用）。
+ * 用户自己在 json 里填了 Token 就以用户的为准。
+ */
+function withToken(cfg) {
+  if (!cfg.apiToken) {
+    try {
+      const builtin = require('../config/builtinSecret');
+      const t = builtin.getApiToken();
+      if (t) {
+        cfg.apiToken = t;
+        cfg.__builtinToken = true;
+      }
+    } catch {
+      /* 内置凭证损坏时退回"未配置" */
+    }
+  }
+  return cfg;
+}
+
+/**
+ * 确保凭证可用：配置文件有 Token 用配置的，没有就用内置的；
  * Account ID / Zone ID 缺失时用 Token 自动反查（界面不再让用户填）。
  */
 async function ensureCredentials(cfg) {
+  withToken(cfg);
   if (!cfg.apiToken) {
     throw new Error(
-      '服务端未配置 Cloudflare API Token（在配置目录的 cloudflare_tunnel.json 里写 apiToken 即可，Account/Zone 会自动识别）',
+      '服务端没有可用的 Cloudflare API Token（配置文件和内置凭证都为空）',
     );
   }
   if (!cfg.zoneId || !cfg.accountId) {
@@ -193,7 +247,9 @@ async function checkSubdomain(input) {
 }
 
 async function ensureTunnel(cfg) {
-  const name = cfg.tunnelName || machineTunnelName();
+  // 隧道名一律按本机身份生成，不沿用配置里可能来自别的机器的 tunnelName；
+  // 这样两台电脑各查各的名字，查不到就各自新建，永远不会复用同一条。
+  const name = machineTunnelName();
   const list = await cfFetch('GET', `/accounts/${cfg.accountId}/cfd_tunnel?name=${encodeURIComponent(name)}&is_deleted=false`, cfg);
   if (list.status !== 200 || !list.json || !list.json.success) {
     throw new Error(`列隧道失败：${cfErrorText(list.json)}`);
@@ -367,6 +423,24 @@ async function enable(payload) {
     }
 
     await ensureTunnel(cfg);
+    // 子域名唯一性：已被别的隧道或别的记录占用时，不改写 DNS，直接让用户换一个
+    if (!p.allowTakeover) {
+      const probe = await cfFetch('GET', `/zones/${cfg.zoneId}/dns_records?name=${encodeURIComponent(hostname)}`, cfg);
+      if (probe.status === 200 && probe.json && probe.json.success) {
+        const records = probe.json.result || [];
+        const mine = String(cfg.tunnelId).slice(0, 8);
+        const mineRecord = records.find((x) => x.type === 'CNAME' && String(x.content).includes(mine));
+        if (records.length && !mineRecord) {
+          const other = records[0];
+          const otherTunnel = other.type === 'CNAME' ? String(other.content).split('.')[0].slice(0, 8) : other.content;
+          return {
+            success: false,
+            code: 'HOSTNAME_TAKEN',
+            message: `子域名 ${hostname} 已被占用（${other.type} → ${otherTunnel}），不是本机的隧道。请换一个子域名，例如 ${sub}-2。`,
+          };
+        }
+      }
+    }
     await ensureDns(cfg, hostname);
 
     const httpPort = payload && payload.httpPort ? String(payload.httpPort) : String(currentService.replace(/[^0-9]/g, '') || 6789);
@@ -424,9 +498,9 @@ async function syncAndStart(httpPort) {
  * 15 秒缓存，避免每次刷界面都打接口。
  */
 async function refreshHealth(force = false) {
-  const cfg = loadConfig();
+  const cfg = withToken(loadConfig());
   if (!cfg.enabled || !cfg.apiToken || !cfg.accountId || !cfg.tunnelId) {
-    remoteHealth = { status: 'inactive', connections: 0, checkedAt: Date.now(), error: '' };
+    remoteHealth = { status: 'inactive', connections: 0, connectors: 0, checkedAt: Date.now(), error: '' };
     return remoteHealth;
   }
   if (!force && Date.now() - remoteHealth.checkedAt < 15000) return remoteHealth;
@@ -436,19 +510,33 @@ async function refreshHealth(force = false) {
     const r = await cfFetch('GET', `/accounts/${cfg.accountId}/cfd_tunnel/${cfg.tunnelId}`, cfg);
     if (r.status === 200 && r.json && r.json.success && r.json.result) {
       const t = r.json.result;
+      const conns = Array.isArray(t.connections) ? t.connections : [];
+      // 同一台机器的 cloudflared 多条连接共用 client_id；不同机器 client_id 不同。
+      // 去重后 >1 就说明有别的设备也连着这条隧道（流量会被随机分流），必须告警。
+      const clients = new Set(conns.map((c) => c && c.client_id).filter(Boolean));
+      const ips = new Set(conns.map((c) => c && c.origin_ip).filter(Boolean));
       remoteHealth = {
         status: t.status || 'unknown',
-        connections: Array.isArray(t.connections) ? t.connections.length : 0,
+        connections: conns.length,
+        connectors: clients.size || (conns.length ? 1 : 0),
+        originIps: ips.size,
         checkedAt: Date.now(),
         error: '',
       };
+      if (clients.size > 1) {
+        if (!conflictSince) conflictSince = Date.now();
+      } else {
+        conflictSince = 0;
+      }
     } else {
-      remoteHealth = { status: 'unknown', connections: 0, checkedAt: Date.now(), error: cfErrorText(r.json) };
+      remoteHealth = { status: 'unknown', connections: 0, connectors: 0, originIps: 0, checkedAt: Date.now(), error: cfErrorText(r.json) };
     }
   } catch (e) {
     remoteHealth = {
       status: 'unknown',
       connections: 0,
+      connectors: 0,
+      originIps: 0,
       checkedAt: Date.now(),
       error: (e && e.message ? e.message : String(e)).slice(0, 200),
     };
@@ -459,18 +547,34 @@ async function refreshHealth(force = false) {
 }
 
 async function getStatus() {
-  const cfg = loadConfig();
+  const cfg = withToken(loadConfig());
   await refreshHealth().catch(() => {});
   const processRunning = !!child && !child.killed && child.exitCode === null;
   const health = cfg.enabled ? remoteHealth.status : 'inactive';
   // 以 Cloudflare 侧状态为主：healthy 或 degraded 但仍有连接，就算"能用的"
   const online = health === 'healthy' || (health === 'degraded' && remoteHealth.connections > 0);
+  const connectors = cfg.enabled ? (remoteHealth.connectors || 0) : 0;
+  const originIps = cfg.enabled ? (remoteHealth.originIps || 0) : 0;
+  // 同一条隧道被多台机器同时连接：每台各 4 条连接，请求会在机器之间随机分流（静默串台）
+  // 稳定超过 60 秒才算，避开重启后旧连接尚未回收的瞬态
+  const conflict = connectors > 1 && conflictSince > 0 && Date.now() - conflictSince >= 60000;
+  let conflictHint = '';
+  if (conflict) {
+    conflictHint =
+      originIps > 1
+        ? `检测到 ${connectors} 个 cloudflared 连接源来自 ${originIps} 个不同出口，说明另一台设备也连着这条隧道（${cfg.hostname || ''}），访问会随机落到不同机器，数据会对不上。请只让一台开隧道，或给另一台换独立子域名。`
+        : `检测到本机有 ${connectors} 个 cloudflared 进程同时连这条隧道（多为服务端重启后的残留进程）。不影响使用，重启服务端即可清掉。`;
+  }
   return {
     enabled: !!cfg.enabled,
     running: processRunning || online,
     processRunning,
     health,
     connections: remoteHealth.connections,
+    connectors,
+    originIps,
+    conflict,
+    conflictHint,
     healthError: remoteHealth.error || '',
     hostname: cfg.hostname || '',
     url: cfg.hostname ? `https://${cfg.hostname}` : '',
@@ -482,7 +586,7 @@ async function getStatus() {
     hasAccount: !!cfg.accountId,
     hasZone: !!cfg.zoneId,
     hasToken: !!cfg.apiToken,
-    tunnelName: cfg.tunnelName || '',
+    tunnelName: machineTunnelName(),
     lastService: cfg.lastService || '',
     lastError,
     lastLog,

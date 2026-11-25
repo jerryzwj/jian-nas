@@ -15,6 +15,9 @@ build/
 logs/
 server/node_modules/
 
+# —— 内置凭证（密钥+密文同文件，绝不入库；打包前用 tools/make_builtin_secret.js 生成）——
+server/src/config/builtinSecret.js
+
 # —— 系统 ——
 Thumbs.db
 .DS_Store
